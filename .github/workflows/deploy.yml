@@ -1,0 +1,107 @@
+name: Recipe App CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: |
+          backend/package-lock.json
+          frontend/package-lock.json
+
+    - name: Install backend dependencies
+      run: |
+        cd backend
+        npm ci
+
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci
+
+    - name: Test backend
+      run: |
+        cd backend
+        npm test
+
+    - name: Test frontend
+      run: |
+        cd frontend
+        npm test
+
+    - name: Authenticate to Google Cloud
+      if: github.event_name == 'push'
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+        service_account: ${{ secrets.GCP_SA_EMAIL }}
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Set up gcloud
+      if: github.event_name == 'push'
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Configure Docker
+      if: github.event_name == 'push'
+      run: gcloud auth configure-docker
+
+    - name: Build and push backend image
+      if: github.event_name == 'push'
+      run: |
+        cd backend
+        docker build -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/recipe-backend:${{ github.sha }} .
+        docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/recipe-backend:${{ github.sha }}
+
+    - name: Build and push frontend image
+      if: github.event_name == 'push'
+      run: |
+        cd frontend
+        BACKEND_URL=$(gcloud run services describe recipe-backend --region=${{ secrets.GCP_REGION }} --format='value(status.url)' 2>/dev/null || echo "https://recipe-backend-6641271514.us-central1.run.app")
+        docker build --build-arg VITE_API_URL=$BACKEND_URL -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/recipe-frontend:${{ github.sha }} .
+        docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/recipe-frontend:${{ github.sha }}
+
+    - name: Deploy backend to Cloud Run
+      if: github.event_name == 'push'
+      run: |
+        gcloud run deploy recipe-backend \
+          --image gcr.io/${{ secrets.GCP_PROJECT_ID }}/recipe-backend:${{ github.sha }} \
+          --region ${{ secrets.GCP_REGION }} \
+          --platform managed \
+          --allow-unauthenticated \
+          --port 8080 \
+          --memory 512Mi
+
+    - name: Deploy frontend to Cloud Run
+      if: github.event_name == 'push'
+      run: |
+        gcloud run deploy recipe-frontend \
+          --image gcr.io/${{ secrets.GCP_PROJECT_ID }}/recipe-frontend:${{ github.sha }} \
+          --region ${{ secrets.GCP_REGION }} \
+          --platform managed \
+          --allow-unauthenticated \
+          --port 80 \
+          --memory 512Mi
+
+    - name: Show service URLs
+      if: github.event_name == 'push'
+      run: |
+        echo "Backend: $(gcloud run services describe recipe-backend --region=${{ secrets.GCP_REGION }} --format='value(status.url)')"
+        echo "Frontend: $(gcloud run services describe recipe-frontend --region=${{ secrets.GCP_REGION }} --format='value(status.url)')"
